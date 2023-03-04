@@ -42,7 +42,7 @@ impl TryFrom<&str> for Rel {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct GhLinkHeader {
     link: reqwest::Url,
     rel: Rel,
@@ -115,6 +115,7 @@ impl WorkflowRunIterator {
             ).parse()?),
         })
     }
+
     async fn try_next(&mut self) -> Result<Option<WorkflowRun>> {
         let next = self.cache.next();
 
@@ -314,4 +315,31 @@ async fn main() -> Result<()> {
     .unwrap();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_gh_header_parse() {
+        let input = "<https://example.com>; rel=\"prev\", <https://example.com>; rel=\"next\", <https://example.com>; rel=\"last\", <https://example.com>; rel=\"first\"";
+
+        let input = reqwest::header::HeaderValue::from_str(input).unwrap();
+
+        assert_eq!(GhLinkHeader::from_header(&input).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_gh_header_individual() {
+        let input = "<https://example.com>; rel=\"prev\"";
+
+        assert_eq!(
+            GhLinkHeader::try_from(input).unwrap(),
+            GhLinkHeader {
+                link: "https://example.com".parse().unwrap(),
+                rel: Rel::Previous
+            }
+        )
+    }
 }
