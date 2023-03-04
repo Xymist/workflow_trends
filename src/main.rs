@@ -13,11 +13,10 @@ use reqwest::{header::HeaderValue, Url};
 use serde::{Deserialize, Serialize};
 use simple_moving_average::{SumTreeSMA, SMA};
 
-// Name of the workflow file to fetch runs for.
-// TODO(Xymist): allow setting this with a flag
-const WORKFLOW_FILE: &str = "tests.yml";
-
-// Possible LINK header labels.
+/// Possible LINK header labels.
+/// We only care about the "next" and "last" ones.
+/// This list may not be exhaustive.
+/// See https://docs.github.com/en/rest/overview/resources-in-the-rest-api?apiVersion=2022-11-28#pagination
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Rel {
     Next,
@@ -42,6 +41,9 @@ impl TryFrom<&str> for Rel {
     }
 }
 
+/// Representation of a single LINK header.
+/// Useful for checking the format and
+/// selecting the right entry by relation.
 #[derive(Debug, PartialEq, Eq)]
 struct GhLinkHeader {
     link: reqwest::Url,
@@ -80,7 +82,7 @@ impl TryFrom<&str> for GhLinkHeader {
             .map_err(|_| eyre!("Link header was not constructed with the expected separators"))?;
 
         // Extract the content of the "rel" section and
-        // discard the rest of the input as we've got what we need
+        // discard the rest of the input, as we've got what we need
         let (_, rel) =
             take_while1::<_, _, nom::error::Error<_>>(|c: char| c.is_ascii_alphabetic())(
                 next_input,
@@ -97,21 +99,31 @@ impl TryFrom<&str> for GhLinkHeader {
 }
 
 struct WorkflowRunIterator {
-    // Stash this so we don't have to go back to the args for it
+    // Stash this so we don't have to go back to the args for it.
+    // Sent in the Authorization header not as a query parameter.
     gh_token: String,
-    // Storage for at most 100 runs from the API
+    // Storage for at most 100 runs from the API.
+    // Technically this could be [Option<WorkflowRun>; 100]
+    // and get filled with tombstones as we empty it,
+    // but that's a bit more complicated than it needs to be
+    // and the performance difference is negligible.
     cache: <Vec<WorkflowRun> as IntoIterator>::IntoIter,
     // Link to the next page of results, if available
     next_link: Option<Url>,
 }
 
 impl WorkflowRunIterator {
-    fn try_new(gh_token: &str, repo: &str) -> Result<Self> {
+    /// Create a new iterator for the given repo and workflow file.
+    /// We don't need to stash either of those in the WorkflowRunIterator
+    /// because they're only used to construct the initial URL. The
+    /// iterator will then use the LINK header to find the next page
+    /// of results.
+    fn try_new(gh_token: &str, repo: &str, workflow_file: &str) -> Result<Self> {
         Ok(WorkflowRunIterator {
             gh_token: gh_token.into(),
             cache: vec![].into_iter(),
             next_link: Some(format!(
-                "https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOW_FILE}/runs?status=success&per_page=100&page=1&created=>2022-06-01"
+                "https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/runs?status=success&per_page=100&page=1&created=>2022-06-01"
             ).parse()?),
         })
     }
@@ -187,6 +199,21 @@ struct WorkflowRunResponse {
     workflow_runs: Vec<WorkflowRun>,
 }
 
+/// A single workflow run.
+/// Contains the time at which the run started,
+/// and the time at which it was last updated,
+/// which is a good proxy for when it finished.
+///
+/// The API doesn't provide a "finished at" time,
+/// nor a duration.
+/// TODO(Xymist): check if this is still true at
+/// some point.
+///
+/// Note: the API returns these as strings, so we
+/// need to parse them into DateTime<Utc> ourselves.
+/// Note2: We don't need everything the API returns,
+/// so we leverage Serde's ability to recognise desired
+/// fields and throw away the rest.
 #[derive(Deserialize, Debug)]
 struct WorkflowRun {
     run_started_at: DateTime<Utc>,
@@ -199,6 +226,10 @@ impl WorkflowRun {
     }
 }
 
+/// A single data point in the set of workflow runs.
+/// Contains the time at which the run started, and
+/// the duration of the run in whole minutes. This
+/// loses a little precision, but it's good enough.
 #[derive(Debug, Clone, Serialize)]
 struct DataPoint {
     started_at: DateTime<Utc>,
@@ -215,30 +246,55 @@ struct DataPoint {
 struct Args {
     /// A valid GitHub API personal access token,
     /// with sufficient permissions to call for
-    /// workflow runs
-    #[arg(long)]
-    gh_token: String,
+    /// workflow runs.
+    /// (e.g. "ghp_1234567890abcdef1234567890abcdef123456")
+    /// (see https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token)
+    #[arg(short, long)]
+    token: String,
     /// An owner/repository pair, as used in GitHub URLs
-    #[arg(long)]
+    /// (e.g. "Xymist/workflow_trends")
+    #[arg(short, long)]
     repo: String,
+    /// The name of the workflow file to fetch runs for
+    #[arg(short, long, default_value = "tests.yml")]
+    workflow_file: String,
+    /// Discard any runs which are more than Nx or less
+    /// than 1/N of the previous run. (e.g. 10x or 1/10th)
+    /// Set to 0 to disable.
+    #[arg(short, long, default_value = "3")]
+    outlier_multiplier: i64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let workflow_name = args
+        .workflow_file
+        .as_str()
+        .trim_end_matches(".yml")
+        .trim_end_matches(".yaml")
+        .replace(' ', "_")
+        .to_lowercase();
+
+    let plot_name = format!("{}_log.png", workflow_name);
+    let csv_name = format!("{}_log.csv", workflow_name);
 
     // Set up drawing canvas for timeline plot
-    let root_area = BitMapBackend::new("workflow_log.png", (1920, 1080)).into_drawing_area();
+    let root_area = BitMapBackend::new(plot_name.as_str(), (1920, 1080)).into_drawing_area();
     root_area.fill(&WHITE).unwrap();
 
     // Establish file and writer for CSV generation
-    let csv_output = tokio::fs::File::create("workflow_log.csv").await?;
+    let csv_output = tokio::fs::File::create(csv_name.as_str()).await?;
     let mut wtr = csv_async::AsyncSerializer::from_writer(csv_output);
 
     // Establish accumulator to be later turned into timeline plot
     let mut acc: Vec<DataPoint> = Vec::new();
 
-    let mut wri = WorkflowRunIterator::try_new(args.gh_token.as_str(), args.repo.as_str())?;
+    let mut wri = WorkflowRunIterator::try_new(
+        args.token.as_str(),
+        args.repo.as_str(),
+        args.workflow_file.as_str(),
+    )?;
 
     let mut previous_duration = 0;
 
@@ -251,17 +307,11 @@ async fn main() -> Result<()> {
             duration_minutes: wr.duration().num_minutes(),
         };
 
-        // Some datapoints are massively outside the norm,
-        // which distorts everything. To compensate for this,
-        // discard any runs which are more than 3x or less
-        // than 1/3 of the previous run
-        // TODO(Xymist): Make this configurable
-        if previous_duration == 0
-            || point
-                .duration_minutes
-                .clamp(previous_duration / 3, previous_duration * 3)
-                == point.duration_minutes
-        {
+        if check_outlier(
+            previous_duration,
+            point.duration_minutes,
+            args.outlier_multiplier,
+        ) {
             previous_duration = point.duration_minutes;
             wtr.serialize(point.clone()).await?;
             acc.push(point);
@@ -315,6 +365,19 @@ async fn main() -> Result<()> {
     .unwrap();
 
     Ok(())
+}
+
+fn check_outlier(previous_duration: i64, current_duration: i64, outlier_multiplier: i64) -> bool {
+    // If the multiplier is 0, we don't want to filter anything
+    // If the previous duration is 0, we don't have a baseline to compare against
+    if previous_duration == 0 || outlier_multiplier == 0 {
+        return true;
+    }
+
+    let lower_bound = previous_duration / outlier_multiplier;
+    let upper_bound = previous_duration * outlier_multiplier;
+
+    current_duration.clamp(lower_bound, upper_bound) == current_duration
 }
 
 #[cfg(test)]
