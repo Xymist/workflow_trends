@@ -1,6 +1,6 @@
 use std::ops::Div;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use clap::{ColorChoice, Parser};
 use color_eyre::eyre::{eyre, Result};
 use nom::bytes::complete::{tag_no_case, take_until1, take_while1};
@@ -98,6 +98,23 @@ impl TryFrom<&str> for GhLinkHeader {
     }
 }
 
+struct SeedUrl(Url);
+
+impl SeedUrl {
+    pub fn new(repo: &str, workflow_file: &str, date_range: &str) -> Result<Self> {
+        let url = format!(
+            "https://api.github.com/repos/{}/actions/workflows/{}/runs?status=success&per_page=100&page=1&created={}",
+            repo, workflow_file, date_range
+        );
+
+        Ok(SeedUrl(url.parse()?))
+    }
+
+    pub fn url(&self) -> Option<Url> {
+        Some(self.0.clone())
+    }
+}
+
 struct WorkflowRunIterator {
     // Stash this so we don't have to go back to the args for it.
     // Sent in the Authorization header not as a query parameter.
@@ -118,13 +135,11 @@ impl WorkflowRunIterator {
     /// because they're only used to construct the initial URL. The
     /// iterator will then use the LINK header to find the next page
     /// of results.
-    fn try_new(gh_token: &str, repo: &str, workflow_file: &str) -> Result<Self> {
+    fn try_new(gh_token: &str, repo: &str, workflow_file: &str, date_range: &str) -> Result<Self> {
         Ok(WorkflowRunIterator {
             gh_token: gh_token.into(),
             cache: vec![].into_iter(),
-            next_link: Some(format!(
-                "https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/runs?status=success&per_page=100&page=1&created=>2022-06-01"
-            ).parse()?),
+            next_link: SeedUrl::new(repo, workflow_file, date_range)?.url(),
         })
     }
 
@@ -186,10 +201,9 @@ impl WorkflowRunIterator {
 
         // The cache was empty and we didn't have a "next" link.
         // We're probably out, or at least GitHub doesn't feel
-        // like giving us any more. Suspiciously, this reliably
-        // happens at 1000 records.
-        // TODO(Xymist): re-read GitHub docs to see if there's
-        // another limit.
+        // like giving us any more. Search queries are, per several
+        // sources, limited to 1000 results, so we're unlikely to
+        // get more than 10 pages of results anyway.
         Ok(None)
     }
 }
@@ -265,6 +279,14 @@ struct Args {
     outlier_multiplier: i64,
 }
 
+fn original_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2022, 6, 1).expect("Invalid default date given")
+}
+
+fn tick_date(previous: &mut NaiveDate) {
+    *previous += chrono::Duration::days(90);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -290,32 +312,49 @@ async fn main() -> Result<()> {
     // Establish accumulator to be later turned into timeline plot
     let mut acc: Vec<DataPoint> = Vec::new();
 
-    let mut wri = WorkflowRunIterator::try_new(
-        args.token.as_str(),
-        args.repo.as_str(),
-        args.workflow_file.as_str(),
-    )?;
+    // Initialize the iteration with a date before we started making changes to our process
+    let mut start_search_date = original_date();
+    let mut end_search_date = start_search_date;
+    tick_date(&mut end_search_date);
+    let mut date_range = format!("{}..{}", start_search_date, end_search_date);
 
-    let mut previous_duration = 0;
+    // Iterate over the last 2 years of runs, 6 months at a time
 
-    while let Some(wr) = wri.try_next().await? {
-        let point = DataPoint {
-            started_at: wr.run_started_at,
-            // The scale here goes to over an hour; seconds
-            // are the default but realistically minutes are
-            // what makes sense.
-            duration_minutes: wr.duration().num_minutes(),
-        };
+    while end_search_date < chrono::offset::Utc::now().date_naive() {
+        let mut wri = WorkflowRunIterator::try_new(
+            args.token.as_str(),
+            args.repo.as_str(),
+            args.workflow_file.as_str(),
+            &date_range,
+        )?;
 
-        if check_outlier(
-            previous_duration,
-            point.duration_minutes,
-            args.outlier_multiplier,
-        ) {
-            previous_duration = point.duration_minutes;
-            wtr.serialize(point.clone()).await?;
-            acc.push(point);
+        let mut previous_duration = 0;
+
+        while let Some(wr) = wri.try_next().await? {
+            let point = DataPoint {
+                started_at: wr.run_started_at,
+                // The scale here goes to over an hour; seconds
+                // are the default but realistically minutes are
+                // what makes sense.
+                duration_minutes: wr.duration().num_minutes(),
+            };
+
+            if check_outlier(
+                previous_duration,
+                point.duration_minutes,
+                args.outlier_multiplier,
+            ) {
+                previous_duration = point.duration_minutes;
+                wtr.serialize(point.clone()).await?;
+                acc.push(point);
+            }
         }
+
+        start_search_date = end_search_date;
+        tick_date(&mut end_search_date);
+        date_range = format!("{}..{}", start_search_date, end_search_date);
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     wtr.flush().await?;
@@ -374,6 +413,8 @@ fn check_outlier(previous_duration: i64, current_duration: i64, outlier_multipli
         return true;
     }
 
+    // We could try to be clever and use standard deviation here, but
+    // I'm not sure it's worth the effort.
     let lower_bound = previous_duration / outlier_multiplier;
     let upper_bound = previous_duration * outlier_multiplier;
 
